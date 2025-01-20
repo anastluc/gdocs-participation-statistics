@@ -179,19 +179,33 @@ class GoogleDocsAnalyzer:
             self.console.print(f"[red]Error retrieving comments: {str(e)}[/red]")
             return []
 
+    def _get_user_email(self, user_info: dict) -> str:
+        """Extract email address from user info dictionary."""
+        try:
+            if 'emailAddress' in user_info:
+                return user_info['emailAddress']
+            return 'Email not available'
+        except:
+            return 'Email not available'
+
+    # Update analyze_contributions method
     def analyze_contributions(self, revisions: List[dict]) -> Dict[str, dict]:
         """Analyze user contributions from revision history."""
         contributions = defaultdict(lambda: {
             'revision_count': 0,
             'last_modified': None,
-            'first_modified': None
+            'first_modified': None,
+            'email': 'Email not available'
         })
 
         for revision in sorted(revisions, key=lambda x: x.get('modifiedTime', '')):
-            user = revision.get('lastModifyingUser', {}).get('displayName', 'Unknown User')
+            user_info = revision.get('lastModifyingUser', {})
+            user = user_info.get('displayName', 'Unknown User')
+            email = self._get_user_email(user_info)
             mod_time = self._format_timestamp(revision.get('modifiedTime', ''))
             
             contributions[user]['revision_count'] += 1
+            contributions[user]['email'] = email
             
             if not contributions[user]['first_modified']:
                 contributions[user]['first_modified'] = mod_time
@@ -456,20 +470,31 @@ class GoogleDocsAnalyzer:
         comment_stats = defaultdict(lambda: {
             'comments_made': 0,
             'replies_made': 0,
-            'resolved_comments': 0
+            'resolved_comments': 0,
+            'email': 'Email not available'
         })
 
         for comment in comments:
-            author = comment.get('author', {}).get('displayName', 'Unknown User')
+            author_info = comment.get('author', {})
+            author = author_info.get('displayName', 'Unknown User')
+            # Get email from the correct location in comment author structure
+            email = author_info.get('me', False) and 'me' or author_info.get('email', 'Email not available')
             comment_stats[author]['comments_made'] += 1
+            comment_stats[author]['email'] = email
             
             if comment.get('resolved', False):
-                resolver = comment.get('resolvedBy', {}).get('displayName', author)
+                resolver_info = comment.get('resolvedBy', {})
+                resolver = resolver_info.get('displayName', author)
+                resolver_email = resolver_info.get('me', False) and 'me' or resolver_info.get('email', 'Email not available')
                 comment_stats[resolver]['resolved_comments'] += 1
+                comment_stats[resolver]['email'] = resolver_email
             
             for reply in comment.get('replies', []):
-                reply_author = reply.get('author', {}).get('displayName', 'Unknown User')
+                reply_author_info = reply.get('author', {})
+                reply_author = reply_author_info.get('displayName', 'Unknown User')
+                reply_email = reply_author_info.get('me', False) and 'me' or reply_author_info.get('email', 'Email not available')
                 comment_stats[reply_author]['replies_made'] += 1
+                comment_stats[reply_author]['email'] = reply_email
 
         return dict(comment_stats)
 
@@ -507,96 +532,7 @@ class GoogleDocsAnalyzer:
             self.console.print(f"[red]Error counting words: {str(e)}[/red]")
             return 0
         
-    def analyze_word_growth(self, doc_id: str, revisions: List[dict]) -> pd.DataFrame:
-        """Analyze the growth of total words over time and provide user statistics."""
-        import time
-        word_history = []
-        prev_word_count = 0
-        total_revisions = len(revisions)
-        
-        self.console.print(f"\n[yellow]Analyzing {total_revisions} revisions for word count history...[/yellow]")
-        
-        # Sort revisions by time
-        sorted_revisions = sorted(revisions, key=lambda x: x.get('modifiedTime', ''))
-        
-        for i, revision in enumerate(sorted_revisions, 1):
-            revision_id = revision.get('id')
-            mod_time = revision.get('modifiedTime')
-            user = revision.get('lastModifyingUser', {}).get('displayName', 'Unknown User')
-            
-            if revision_id and mod_time:
-                self.console.print(f"Processing revision {i}/{total_revisions}")
-                
-                # Get content with delay
-                content = self.get_revision_content(doc_id, revision_id)
-                word_count = self.count_words(content)
-                
-                # Only record significant changes (more than 1 word difference)
-                word_diff = word_count - prev_word_count
-                if abs(word_diff) >= 2 or i == 1 or i == total_revisions:
-                    word_history.append({
-                        'timestamp': datetime.fromisoformat(mod_time.replace('Z', '+00:00')),
-                        'total_words': word_count,
-                        'word_change': word_diff,
-                        'user': user
-                    })
-                    prev_word_count = word_count
-                
-                # Add delay between revisions
-                if i < total_revisions:
-                    time.sleep(3)  # 3 second delay
-        
-        self.console.print("[green]Word count analysis complete![/green]")
-        
-        # Convert to DataFrame and sort by timestamp
-        df = pd.DataFrame(word_history)
-        if not df.empty:
-            df.sort_values('timestamp', inplace=True)
-            df.reset_index(drop=True, inplace=True)
-            
-            # Create user statistics
-            user_stats = df.groupby('user').agg({
-                'word_change': [
-                    ('total_words_added', lambda x: x[x > 0].sum()),
-                    ('total_words_removed', lambda x: abs(x[x < 0].sum())),
-                    ('net_words_added', 'sum'),
-                    ('number_of_edits', 'count')
-                ]
-            })
-            
-            # Flatten column names
-            user_stats.columns = user_stats.columns.get_level_values(1)
-            user_stats = user_stats.reset_index()
-            
-            # Calculate average words per edit
-            user_stats['avg_words_per_edit'] = (user_stats['total_words_added'] + user_stats['total_words_removed']) / user_stats['number_of_edits']
-            
-            # Sort by net words added
-            user_stats = user_stats.sort_values('net_words_added', ascending=False)
-            
-            # Display user statistics
-            stats_table = Table(title="\nUser Word Count Statistics")
-            stats_table.add_column("User")
-            stats_table.add_column("Words Added")
-            stats_table.add_column("Words Removed")
-            stats_table.add_column("Net Change")
-            stats_table.add_column("Number of Edits")
-            stats_table.add_column("Avg Words/Edit")
-            
-            for _, row in user_stats.iterrows():
-                stats_table.add_row(
-                    row['user'],
-                    f"{int(row['total_words_added']):,}",
-                    f"{int(row['total_words_removed']):,}",
-                    f"{int(row['net_words_added']):,}",
-                    str(row['number_of_edits']),
-                    f"{row['avg_words_per_edit']:.1f}"
-                )
-            
-            self.console.print(stats_table)
-        
-        return df
-
+    
     def display_analytics(self, doc_id: str) -> None:
         """Display comprehensive analytics for the document."""
         try:
@@ -643,11 +579,92 @@ class GoogleDocsAnalyzer:
             self.console.print(table)
         return metadata
 
+    def analyze_word_growth(self, doc_id: str, revisions: List[dict]) -> pd.DataFrame:
+        """Analyze the growth of total words over time and provide user statistics."""
+        import time
+        word_history = []
+        prev_word_count = 0
+        total_revisions = len(revisions)
+        
+        self.console.print(f"\n[yellow]Analyzing {total_revisions} revisions for word count history...[/yellow]")
+        
+        sorted_revisions = sorted(revisions, key=lambda x: x.get('modifiedTime', ''))
+        
+        for i, revision in enumerate(sorted_revisions, 1):
+            revision_id = revision.get('id')
+            mod_time = revision.get('modifiedTime')
+            user_info = revision.get('lastModifyingUser', {})
+            user = user_info.get('displayName', 'Unknown User')
+            email = self._get_user_email(user_info)
+            
+            if revision_id and mod_time:
+                self.console.print(f"Processing revision {i}/{total_revisions}")
+                
+                content = self.get_revision_content(doc_id, revision_id)
+                word_count = self.count_words(content)
+                
+                word_diff = word_count - prev_word_count
+                if abs(word_diff) >= 2 or i == 1 or i == total_revisions:
+                    word_history.append({
+                        'timestamp': datetime.fromisoformat(mod_time.replace('Z', '+00:00')),
+                        'total_words': word_count,
+                        'word_change': word_diff,
+                        'user': user,
+                        'email': email
+                    })
+                    prev_word_count = word_count
+                
+                if i < total_revisions:
+                    time.sleep(3)
+
+        self.console.print("[green]Word count analysis complete![/green]")
+        
+        df = pd.DataFrame(word_history)
+        if not df.empty:
+            df.sort_values('timestamp', inplace=True)
+            df.reset_index(drop=True, inplace=True)
+            
+            user_stats = df.groupby(['user', 'email']).agg({
+                'word_change': [
+                    ('total_words_added', lambda x: x[x > 0].sum()),
+                    ('total_words_removed', lambda x: abs(x[x < 0].sum())),
+                    ('net_words_added', 'sum'),
+                    ('number_of_edits', 'count')
+                ]
+            })
+            
+            user_stats.columns = user_stats.columns.get_level_values(1)
+            user_stats = user_stats.reset_index()
+            
+            user_stats['avg_words_per_edit'] = (user_stats['total_words_added'] + user_stats['total_words_removed']) / user_stats['number_of_edits']
+            user_stats = user_stats.sort_values('net_words_added', ascending=False)
+            
+            stats_table = Table(title="\nUser Word Count Statistics")
+            stats_table.add_column("User")
+            stats_table.add_column("Email")
+            stats_table.add_column("Words Added")
+            stats_table.add_column("Words Removed")
+            stats_table.add_column("Net Change")
+            stats_table.add_column("Number of Edits")
+            stats_table.add_column("Avg Words/Edit")
+            
+            for _, row in user_stats.iterrows():
+                stats_table.add_row(
+                    row['user'],
+                    row['email'],
+                    f"{int(row['total_words_added']):,}",
+                    f"{int(row['total_words_removed']):,}",
+                    f"{int(row['net_words_added']):,}",
+                    str(row['number_of_edits']),
+                    f"{row['avg_words_per_edit']:.1f}"
+                )
+            
+            self.console.print(stats_table)
+        
+        return df
+
     def _display_revision_analysis(self, doc_id: str, revisions: List[dict]) -> Optional[pd.DataFrame]:
-        """Display revision analysis and return word growth data."""
         try:
-            # Word growth analysis
-            self.console.print("[yellow]Analyzing word count history through revisions (this may take a while)...[/yellow]")
             word_growth_df = self.analyze_word_growth(doc_id, revisions)
             
             if not word_growth_df.empty:
@@ -656,23 +673,22 @@ class GoogleDocsAnalyzer:
                 table.add_column("Total Words")
                 table.add_column("Word Change")
                 table.add_column("User")
+                table.add_column("Email")
                 
-                # Display last 10 revisions for brevity
-                # for _, row in word_growth_df.tail(10).iterrows():
                 for _, row in word_growth_df.iterrows():
                     table.add_row(
                         row['timestamp'].strftime('%Y-%m-%d %H:%M:%S'),
                         str(row['total_words']),
                         f"{row['word_change']:+d}",
-                        row['user']
+                        row['user'],
+                        row['email']
                     )
                 self.console.print(table)
-                # self.console.print("[dim](Showing last 10 revisions)[/dim]")
             
-            # User contributions
             contributions = self.analyze_contributions(revisions)
             table = Table(title="\nUser Contributions")
             table.add_column("User")
+            table.add_column("Email")
             table.add_column("Revisions")
             table.add_column("First Modified")
             table.add_column("Last Modified")
@@ -680,6 +696,7 @@ class GoogleDocsAnalyzer:
             for user, stats in sorted(contributions.items(), key=lambda x: x[1]['revision_count'], reverse=True):
                 table.add_row(
                     user,
+                    stats['email'],
                     str(stats['revision_count']),
                     str(stats['first_modified']),
                     str(stats['last_modified'])
@@ -691,11 +708,12 @@ class GoogleDocsAnalyzer:
         except Exception as e:
             self.console.print(f"[yellow]Error in revision analysis: {str(e)}[/yellow]")
             return None
-
+    
     def _display_activity_analysis(self, doc_id: str) -> Optional[List[dict]]:
         """Display activity analysis and return activities for further use."""
         try:
             activities = self.get_activity_history(doc_id)
+            # print(activities[0])
             if activities:
                 word_contributions = self.calculate_word_contributions(activities)
                 
@@ -722,6 +740,7 @@ class GoogleDocsAnalyzer:
             
             table = Table(title="\nComment Activity")
             table.add_column("User")
+            table.add_column("Email")
             table.add_column("Comments Made")
             table.add_column("Replies Made")
             table.add_column("Comments Resolved")
@@ -729,13 +748,14 @@ class GoogleDocsAnalyzer:
             for user, stats in sorted(comment_stats.items(), key=lambda x: x[1]['comments_made'], reverse=True):
                 table.add_row(
                     user,
+                    stats['email'],
                     str(stats['comments_made']),
                     str(stats['replies_made']),
                     str(stats['resolved_comments'])
                 )
             self.console.print(table)
         return comments
-
+    
     def _display_historical_analysis(
         self, 
         activities: Optional[List[dict]], 
